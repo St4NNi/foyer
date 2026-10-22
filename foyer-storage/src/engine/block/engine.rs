@@ -40,6 +40,7 @@ use futures_util::{
     future::{join_all, try_join_all},
 };
 use itertools::Itertools;
+use parking_lot::Mutex;
 
 use super::{
     flusher::{Flusher, InvalidStats, Submission},
@@ -439,6 +440,7 @@ where
             submit_queue_size,
             submit_queue_size_threshold: self.submit_queue_size_threshold,
             sequence,
+            submit_lock: Mutex::new(()),
             _spawner: runtime,
             active: AtomicBool::new(true),
             metrics,
@@ -516,6 +518,9 @@ where
     submit_queue_size_threshold: usize,
 
     sequence: AtomicSequence,
+    /// Makes taking a sequence and submitting the entry one step, so that every flusher receives and writes entries
+    /// in sequence order. Recovery stops reading a block at the first entry with a lower sequence than the one before.
+    submit_lock: Mutex<()>,
 
     _spawner: Spawner,
 
@@ -594,6 +599,7 @@ where
             return;
         }
 
+        let _guard = self.inner.submit_lock.lock();
         let sequence = self.inner.sequence.fetch_add(1, Ordering::Relaxed);
 
         self.inner.flushers[piece.hash() as usize % self.inner.flushers.len()].submit(Submission::CacheEntry {
@@ -1192,6 +1198,67 @@ mod tests {
             store.load(memory.hash(&3)).await.unwrap().kv(),
             Some((3, vec![3; 3 * KB]))
         );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_store_concurrent_enqueue_recovery() {
+        const THREADS: u64 = 8;
+        const ENTRIES: u64 = 512;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1 MiB blocks, so that entries from all threads share the same blocks.
+        let build = || async {
+            let device = FsDeviceBuilder::new(dir.path())
+                .with_capacity(ByteSize::mib(16).as_u64() as _)
+                .build()
+                .unwrap();
+            let spawner = Spawner::current();
+            let io_engine = io_engine_for_test(spawner.clone()).await;
+            let builder = BlockEngineConfig::<u64, Vec<u8>, TestProperties>::new(device)
+                .with_block_size(ByteSize::mib(1).as_u64() as _);
+            Box::new(builder)
+                .build(EngineBuildContext {
+                    io_engine,
+                    metrics: Arc::new(Metrics::noop()),
+                    spawner,
+                    recover_mode: RecoverMode::Strict,
+                })
+                .await
+                .unwrap()
+        };
+
+        let memory = cache_for_test();
+        let store = build().await;
+
+        let es = (0..ENTRIES).map(|i| memory.insert(i, vec![i as u8; KB])).collect_vec();
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let store = &store;
+                let es = &es;
+                s.spawn(move || {
+                    for e in es.iter().skip(t as usize).step_by(THREADS as usize) {
+                        enqueue(store, e.clone());
+                    }
+                });
+            }
+        });
+        store.wait().await;
+
+        for i in 0..ENTRIES {
+            let kv = store.load(memory.hash(&i)).await.unwrap().kv();
+            assert!(kv == Some((i, vec![i as u8; KB])), "entry {i} is lost");
+        }
+
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = build().await;
+
+        for i in 0..ENTRIES {
+            let kv = store.load(memory.hash(&i)).await.unwrap().kv();
+            assert!(kv == Some((i, vec![i as u8; KB])), "entry {i} is lost");
+        }
     }
 
     // FIXME(MrCroxx): Move the admission test to store level.
